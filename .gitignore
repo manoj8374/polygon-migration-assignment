@@ -1,0 +1,21 @@
+# Secrets and local config
+.env
+*.env
+!.env.example
+
+# Python
+venv/
+.venv/
+__pycache__/
+*.pyc
+
+# Django runtime output
+logs/
+staticfiles/
+db.sqlite3
+
+# Editors / OS
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
