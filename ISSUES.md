@@ -1,7 +1,6 @@
 # Issues Analysis
 
-Line numbers refer to the original starter code (commit `ab4a864`, branch `main`).
-"Tested" means I ran it and saw the result. "From code" means I concluded it by reading the code.
+Line numbers refer to the current code in this branch, after my fixes, not the original starter code.
 
 ## Summary
 
@@ -12,293 +11,180 @@ Line numbers refer to the original starter code (commit `ab4a864`, branch `main`
 
 ---
 
-## Product Issues (1 = highest priority)
+## Product Issues
 
-### [P1] Re-migrating a problem leaves stale test cases in the database but still reports success
-
-**Severity**: High
-
-**Location**: `problems/views.py:455-464` (sample tests), `problems/views.py:530-546` (test cases)
-
-**Problem**:
-When a problem is migrated again, the code reads the existing rows and overwrites them by position
-(`if idx < len(existing_test_cases): update ... else: create`). Nothing ever deletes the rows that are
-no longer in Polygon. If a setter removes tests on Polygon, the old rows at the end stay in the database.
-Tested (simulated): the database had 15 `ProblemTestCase` rows and Polygon returned 8 tests. After
-"Migrate Test Description to Database" the page said "Test cases description migrated to database
-Successfully." and there were still 15 rows (8 updated, 7 untouched). The cloud-storage upload, by contrast, deletes
-the whole folder first, so storage ends up correct and the database does not.
-
-**Impact**:
-The staff user is told everything worked, but the database holds test cases that no longer exist in
-the real problem. If the platform judges submissions against these rows, they can be wrong. The database and
-storage disagree, and nothing on the page warns about it. It is hard to notice and hard to debug later.
-
-**Recommended improvement**:
-Make the migration replace the set of tests, not patch by position: delete the problem's existing
-`SampleTestCase`/`ProblemTestCase` rows that are not in the new list (or delete and re-insert inside the
-transaction). Show a short summary before and after ("12 tests will replace 20; 8 will be removed") and
-ask for confirmation when tests are removed. Report the real counts in the success message.
-
-**Priority rationale**:
-It silently produces wrong data, which is worse than a visible failure, and it happens in the main
-"update an existing problem" flow. It ranks first because the user gets no signal that anything is wrong
-and the damage reaches whatever uses this data downstream.
-
----
-
-### [P2] "Migrate Test Description to Database" actually copies test data, and truncates it
+### [P1] If one test fail to download, it is dropped silently and page still says "Success"
 
 **Severity**: High
 
-**Location**: `problems/templates/problems/index.html:314` (button label), `problems/views.py:533-541`
+**Location**: Test case table and the green Success box. Code: `problems/polygon_api.py:399-402`, `problems/views.py:493`.
 
-**Problem**:
-The button is called "Migrate Test Description to Database" and the success message says "Test cases
-description migrated". In reality it copies each test's input and output, but cuts both to the first 260
-characters (`input_data[:260]`, `output_data[:260]`) and strips trailing whitespace. Tests with an empty input or
-output are skipped completely. Nothing on the page says any of this. (From code.)
+**Problem**: Fetch downloads every test from Polygon. If one download fails, the code don't stop. It saves that test as empty and continues. I tried with a 5 test problem where test 2 failed once. The page showed test 2 blank with no error. Database step said "Successfully" and saved only 4 rows. Storage said "Uploaded 4 of 5 ... because the input or output was empty", which is not true, the test just did not download. (This storage message is from my fixed code. The starter code skipped the test with only a log line and showed a normal success.)
 
-**Impact**:
-The label makes staff think they are copying a short description, or that the full tests are copied. The
-database copy is incomplete for any large test, while the storage copy is full, so the two copies of the same
-test differ. A user who later relies on the database copy gets wrong data and has no clue why.
+**Impact**: User thinks migration is done but one test is missing. A wrong solution can pass now.
 
-**Recommended improvement**:
-Name the button for what it does (for example "Save test previews to database"), say in the UI that
-inputs and outputs are cut to 260 characters, and show which tests were truncated or skipped in the result
-message. Better, store the full data (or only a reference to the storage object) so there is one source of truth.
+**Recommended improvement**: Treat failed download as an error. Retry it, and if still fails then stop and tell the user. Don't show green when tests are missing.
 
-**Priority rationale**:
-It affects every migration, not only unusual cases, and it misleads users about what was saved. It ranks
-below P1 because P1 makes the data wrong silently, while here the truncation is at least intentional and the
-fix is mainly clearer wording and reporting.
+**Priority rationale**: First, because it is the only one where data is wrong and user is told it is fine. P2 and P3 the user can see, this one he can't.
 
 ---
 
-### [P3] A second problem with the same title cannot be migrated, and the error is a raw database message
+### [P2] Page does not tell which steps are already done
+
+**Severity**: High
+
+**Location**: Main page after Fetch, `problems/templates/problems/index.html:157-168`.
+
+**Problem**: Full migration needs three buttons. Each button only tell about itself. The page never shows which steps was already run for a problem. After Create/Update it says "created successfully", so it feels like everything is done. I found this in my own database: problem 5 has `test_case_count = 13` and 26 files in S3, but 0 rows in test case table. The page looks same as a complete problem. There is also no list of migrated problems.
+
+**Impact**: Every user, every migration. A step gets missed and nobody knows. To check, you have to open admin and the bucket yourself.
+
+**Recommended improvement**: Show a small status box: problem saved or not, how many test rows, how many files in storage. One "Migrate everything" button will also help.
+
+**Priority rationale**: It happens in every migration and I have real proof. It is below P1 because saved data is correct, only incomplete. Above P3 because unfinished problem is worse than slow page.
+
+---
+
+### [P3] Every click takes around 40 seconds and only a spinner is shown
 
 **Severity**: Medium
 
-**Location**: `problems/views.py:298` (`slug = slugify(title)`), `problems/models.py:58` (`slug` is unique), `problems/views.py:382` and `:569`
+**Location**: All four buttons. Spinner text at `problems/templates/problems/index.html:423`.
 
-**Problem**:
-The slug is generated from the title and must be unique, and the user cannot change it. Tested (Django
-test client against the real view, rolled back afterwards): the first "Two Sum" (Polygon 635336) migrated fine. The
-second "Two Sum" (Polygon 635338) failed and the page showed: "Migration failed and all changes have been rolled
-back. Reason: duplicate key value violates unique constraint "problems_problem_slug_key" DETAIL: Key
-(slug)=(two-sum) already exists." No row was created for the second problem.
+**Problem**: I timed it on a problem with 13 tests. Fetch took 37 seconds, Create/Update 37 seconds, and the test description step 42 seconds. Fetch being slow is okay, but the other buttons also downloads the package again and ask Polygon for same things the page was already showing. So even a small problem is more than two minutes of waiting. With more tests it become worse. While waiting there is only a spinner, no progress and no cancel.
 
-**Impact**:
-Two legitimately different problems with the same or similar title cannot both be migrated. The staff user
-sees a database error they cannot act on and has no field to fix it. They have to change the title on Polygon,
-which may not be allowed or desirable.
+**Impact**: Everyone, on every click. With a big problem you can't tell if it is slow or stuck, so people reload.
 
-**Recommended improvement**:
-Let the user see and edit the slug before migrating, or generate a unique one automatically (for example
-`two-sum-2`). Catch the unique-constraint error and show a clear message ("A problem with this title already
-exists: <link>. Choose a different slug").
+**Recommended improvement**: Download from Polygon one time on Fetch and reuse it for other buttons. Run long work in background and show progress like "test 34 of 120".
 
-**Priority rationale**:
-It completely blocks migration for affected problems, but it only happens on a title collision, so it affects
-fewer migrations than P1 and P2. It stays in the top three because it is a hard stop with no workaround inside the tool.
+**Priority rationale**: Nobody can use the tool without facing this, so it is in top 3. But it only waste time, it does not break data, so it is third.
 
 ---
 
-## Code Issues (1 = highest priority)
+## Code Issues
 
-### [C1] One view (`index`) does everything and repeats itself
+### [C1] One function is doing everything
 
 **Severity**: High
 
-**Location**: `problems/views.py:88-583`; repeated blocks at `:262`, `:440`, `:519`; solution lookup at `:155-183` and `:485-509`
+**Location**: `problems/views.py:89-578`, `problems/urls.py:7`. Copies at `views.py:217`, `:395`, `:474` and `problems/polygon_api.py:654`.
 
-**Problem**:
-A single function of about 500 lines handles four different actions (fetch, create/update problem,
-migrate test cases to the database, upload to storage). The same "Redis, else Polygon, then store in Redis" block
-is copied three times, and the main-solution lookup is copied twice. On every POST, whatever button was clicked,
-it also re-downloads the package, re-parses the HTML and re-fetches test cases and checker info for display
-(`:249-322`). There are no service functions and no tests (`problems/tests.py` is empty).
+**Problem**: The whole app is one view of around 490 lines on one URL. It checks hidden form fields to know which button was pressed, then does fetch, save problem, tags, samples, test cases and storage upload in one big `try` block. Because nothing is separated, code is copied. The "get tests from Redis or Polygon" block is there four times (three in `views.py` and one in `migrate_to_storage` in `polygon_api.py`) and the solution lookup two times. There is no Django form. Also `problems/tests.py` has 19 tests but all are for storage classes, none for the view.
 
-**Impact**:
-A new engineer cannot find where one behavior lives, and every change must be made in several places and
-risks breaking another action. The repeated Polygon calls make every click slow and expensive. Nothing can be
-tested on its own.
+**Impact**: To change one action you must read all of them. A fix in one copy is easy to miss in other copies. Every change is tested by clicking only.
 
-**Recommended improvement**:
-Split the view into one small view or handler per action and move the logic into service functions
-(`fetch_problem`, `save_problem`, `save_test_cases`, `upload_to_storage`). Put the repeated "get test cases
-(cached)" code in one function. Only fetch from Polygon what the clicked action needs. Add unit tests for the
-services.
+**Recommended improvement**: One URL and one small view for each action. Move the real work into simple functions like `save_problem` and `save_test_cases`, and write tests for them.
 
-**Priority rationale**:
-It is the root cause of most other problems and the biggest obstacle to maintaining or extending the tool,
-which is what this review is about. It comes first among code issues because C2 and C3 are hard to fix cleanly
-until this is split up.
+**Priority rationale**: First, because it makes every other fix harder. C2 and C3 can be fixed in one place, but first you need to find that place.
 
 ---
 
-### [C2] Syncing test cases is positional and the numbers come from different sources
+### [C2] Models do not enforce their own rules
 
 **Severity**: High
 
-**Location**: `problems/views.py:455-464`, `:530-546`, `:322`, `:538-563`
+**Location**: `problems/models.py:38-80`, `:91-142`, `problems/admin.py:58`, `problems/views.py:269`.
 
-**Problem**:
-Existing rows are matched to new tests by list position, extra rows are never removed (tested, see P1),
-and `order` is only increased for tests that were kept, while the storage upload numbers tests with
-`enumerate` over all of them, so skipped tests make the two numberings disagree (from code).
-`Problem.test_case_count` is set from a fresh Polygon call (`len(api.get_test_cases(...))`, `:322`), but the
-rows are written from the cached list (up to 30 minutes old), so the count and the rows can differ.
+**Problem**: The models look strict but database accept almost anything.
+- `difficulty` has `choices` (`models.py:59`) but they only work with forms. I posted `difficulty=banana` and it got saved with success message.
+- Test rows have no identity. `order` is not unique and Polygon test number is not stored, so rows are matched by position only.
+- Samples are stored in two places, `SampleTestCase` table and `is_sample` flag. Nothing keeps them same.
+- `test_case_count` is a separate number. In my Q2 test it was 12 but rows were 20.
+- Checker list is written two times (`models.py:43-55`, `views.py:269`).
 
-**Impact**:
-The data model has no single, reliable idea of "the tests of this problem". The count, the rows and the storage
-files can each be different, and any code that trusts one of them can be wrong.
+**Impact**: Bad data can come from view, admin or any script. Count, rows and samples can all say different things.
 
-**Recommended improvement**:
-Treat the Polygon test list as the single source of truth for one migration run. Compute the count from
-the same list that is written, key tests by their Polygon index instead of position, delete rows that are not in
-the list, and use the same numbering for the database and storage.
+**Recommended improvement**: Add check constraints and a unique constraint on (`problem`, `order`). Save Polygon test number. Keep samples in one place and compute the count from rows.
 
-**Priority rationale**:
-It is the cause of the data problem in P1 and affects data integrity. It is below C1 because it is
-one specific piece of logic, while C1 is the structure that makes this code hard to find and fix.
+**Priority rationale**: Database is the output of this tool, so it must be trusted. It is second because the fix is small, while C1 blocks everything.
 
 ---
 
-### [C3] External side effects inside a database transaction, failures swallowed, and a cache key that never matches
+### [C3] `PolygonAPI` is four things in one class with no safety for outside services
 
 **Severity**: Medium
 
-**Location**: `problems/views.py:186` (`transaction.atomic`), `:238` and `:572` (`api.delete_azure_blob`); `problems/polygon_api.py:311`, `:401`, `:794`, `:813-820` vs `:865`
+**Location**: `problems/polygon_api.py`, mainly `:96`, `:187`, `:602`, `:714`, `:859`. Also `PolygonMigration/settings.py:148-151`.
 
-**Problem**:
-All work, including uploads to Azure and writes to Redis, runs inside `transaction.atomic()`, but only
-the database can be rolled back, yet the error message says "all changes have been rolled back". The cleanup
-calls `api.delete_azure_blob(...)`, a method that does not exist on `PolygonAPI`, so the cleanup itself would
-fail (from code). Errors are swallowed: `get_test_cases` returns `[]` on any exception (`:311`),
-`get_all_test_cases` turns a failed fetch into empty input and output (`:401`), and the uploader then skips such
-tests with only a log warning (`:794`) and still reports success. `delete_problem_test_case_cache` deletes keys
-matching `oj_dev_with_redis_storage_test_cases_*`, but this app stores keys as
-`polygon_migration_test_cases_{polygon_id}`, so it never clears its own cache.
+**Problem**: This one class is the Polygon client, the Redis cache, the C++ compiler and the storage upload logic.
+- No timeout on `requests.post` (`:96`, `:187`). If Polygon don't answer, the request hangs forever.
+- Redis connection code is pasted four times, and `settings.py` has no `CACHES` setting.
+- Keys are deleted by prefix (`:714`, `:859`). I checked with dummy keys: clearing problem 5 also removed 50 and 57.
+- The prefix `oj_dev_with_redis_storage_test_cases_` looks like it belong to another system, because this app never writes keys with that prefix.
+- Checker is compiled on web server, so on Windows it uploads `custom_checker.exe` (`:602`).
 
-**Impact**:
-A failed or partial migration can look successful, and the "rolled back" message can be false for storage
-and Redis. Missing tests are only visible in a log file. A stale cache can be reused for up to 30 minutes.
+**Impact**: You can't change or test one job without the other three. One slow Polygon call can block a worker, and clearing cache can remove other problem's entries.
 
-**Recommended improvement**:
-Do the database work in the transaction and the external work separately, with explicit, tested cleanup.
-Let Polygon errors propagate (or collect them) and fail the migration when any test cannot be fetched. Report
-how many tests were uploaded versus expected. Use one cache key helper everywhere, and invalidate it
-when a migration finishes.
+**Recommended improvement**: Split into a `PolygonClient` with timeouts, a `TestCaseCache` that deletes exact keys, and a separate checker builder.
 
-**Priority rationale**:
-It can make failures invisible, but it needs a failure to happen first (a network error, an empty test),
-and it is easier to fix once C1 and C2 are done, so it is third.
+**Priority rationale**: Everything goes through this class and it is the biggest file. It is third because it can be split without touching database or the page.
 
 ---
 
 ## Edge Case Analysis
 
-### Q1: 0 sample test cases and 15 regular test cases
+### Q1
 
-**Migration actions**: "Create/Update problem in Database", "Migrate Test Description to Database", then
-"Migrate Test Cases to Storage", on Polygon problem 635342 ("Zero Samples": 15 tests, none marked
-"Use in statements").
+> A Polygon problem has 0 sample test cases but 15 regular test cases. What happens when you migrate this problem?
 
-**What happened (Tested)**:
-All three actions succeeded with no error. After them, the database had the problem with
-`test_case_count = 15`, **0** `SampleTestCase` rows, **15** `ProblemTestCase` rows (none with `is_sample` set),
-and storage had **30** objects (`01` to `15` and their `.a` files) under `test_cases/2/`. On the fetch page all
-15 tests showed "Sample Test Case: No".
+**Migration action**: Fetch, then all three migrate buttons.
 
-**Why (code)**:
-Sample tests are chosen with `is_sample = test.get('useInStatements', False)` in
-`polygon_api.py:get_all_test_cases` and then filtered with `sample_tests = [t for t in test_cases if
-t.get('is_sample')]` in `views.py:453`. With none marked, the list is empty, so the sample loop creates nothing.
-The regular test loop (`views.py:530`) does not depend on samples, so all 15 are saved, and the storage upload
-sends every test with both input and output.
+**What happened (Tested)**: Everything succeeded with no warning. `test_case_count` was 15. Sample table had 0 rows, test case table had 15 rows (none marked sample) and storage had 30 files, `01` to `15` with `.a` files.
 
-**Conclusions from code only (From code)**:
-Because the sample table is empty, anything that shows examples from `SampleTestCase` would show no
-examples for this problem. The tool gives no warning that a problem has no samples.
+**Why (code)**: A test is sample only if Polygon marks it "use in statements" (`polygon_api.py:376`). The view filters on that (`views.py:408`) and gets empty list, so sample loop does nothing. The other two steps don't check this flag.
+
+**From code only (not tested)**: User is never told that problem has no samples, so it can go live without examples.
 
 ---
 
-### Q2: 20 tests migrated, 8 removed on Polygon (12 remain), migrated again
+### Q2
 
-**Migration actions**: "Create/Update problem in Database", "Migrate Test Description to Database", and
-"Migrate Test Cases to Storage", run again after the setter's change.
+> A problem is migrated with 20 test cases. Later, the problem setter removes 8 test cases on Polygon (now 12 remain). The problem is re-migrated. What happens?
 
-**What happened (Tested, simulated)**:
-I did not delete tests on Polygon. I simulated it: the database held 15 `ProblemTestCase` rows and the
-Polygon list was cut to 8. After "Migrate Test Description to Database" the message said "Successfully" and
-there were still **15** rows; the first 8 were overwritten and the last 7 were left unchanged.
+**Migration action**: All three buttons with 20 tests, then again after tests were reduced to 12.
 
-**Why (code)**:
-`views.py:530-546` updates existing rows by position and only creates rows when `idx` is past the end of the
-existing list. There is no delete step. So for 20 rows and 12 tests, rows 1-12 are updated and rows 13-20 stay.
+**What happened (Tested)**: All steps said success but database was wrong. `test_case_count` became 12, but test case table still had 20 rows. Rows 1 to 12 had new content and rows 13 to 20 was the old tests. Sample table kept 3 rows though only 2 samples were left. Storage was correct with 24 files. Also if I did not press Fetch again, it used the old 20 tests, because fetched tests are reused for 30 minutes.
 
-**Conclusions from code only (From code)**:
-- The database would end with 20 rows, while "Create/Update problem in Database" sets `test_case_count` to 12
-  (a fresh `len(api.get_test_cases(...))` call at `:322`), so the count and the rows disagree.
-- Storage ends up correct: `migrate_to_azure_blob` (now `migrate_to_storage`) deletes everything under
-  `test_cases/{id}/` first and then uploads the 12 tests, so storage has 12 pairs.
-- If the setter's change is less than 30 minutes old and the page was fetched before it, the migrate buttons read the
-  Redis cache (`:440`, `:519`), so they could still use the old 20 tests.
+**Why (code)**: Rows are matched by position. If a row exist it is updated, else created (`views.py:499-518`). Nothing is ever deleted. The count comes from a separate Polygon call (`:277`). Storage deletes files that was not in the new upload (`polygon_api.py:696`), so it is correct.
+
+**From code only (not tested)**: Anything reading the table will see 20 tests, and rows 13 to 20 have no file in storage.
 
 ---
 
-### Q3: Two different Polygon problems titled "Two Sum"
+### Q3
 
-**Migration action**: "Create/Update problem in Database", first on Polygon 635336 and then on Polygon 635338.
+> Two different Polygon problems have the exact same title: "Two Sum". You migrate the first one successfully. Then you try to migrate the second one. What happens?
 
-**What happened (Tested)**:
-I ran this with the Django test client against the real view, then rolled the database back. The first
-migration succeeded ("Problem 'Two Sum' created in database successfully", slug `two-sum`). The second
-failed with: "Migration failed and all changes have been rolled back. Reason: duplicate key value violates unique
-constraint "problems_problem_slug_key" ... Key (slug)=(two-sum) already exists." No row was created for the
-second problem.
+**Migration action**: Fetch and Create/Update for first problem, then for second.
 
-**Why (code)**:
-The slug is computed from the title (`views.py:298`, `slugify(title)`), and `Problem.slug` is `unique=True`
-(`models.py:58`). The lookup for an existing problem uses only `polygon_id` (`views.py:354`), so the second
-problem is treated as new, `Problem.objects.create(...)` (`:382`) hits the unique constraint, and the generic
-`except` (`:567-569`) shows the raw database error.
+**What happened (Tested)**: First was created with slug `two-sum`. Second failed, no row was created, and page showed: "Migration failed and all database changes have been rolled back. Reason: duplicate key value violates unique constraint "problems_problem_slug_key" DETAIL: Key (slug)=(two-sum) already exists."
 
-**Conclusions from code only (From code)**:
-The second problem cannot be migrated, and so cannot reach the test-case or storage steps, until its title
-changes on Polygon, because the storage action requires the problem to exist in the database first.
+**Why (code)**: Slug is made from title (`views.py:253`) and must be unique (`models.py:58`). The view finds existing problem only by Polygon ID (`:309`), so it tries to create new one (`:337`) and database rejects it. Error handler just prints the database message.
+
+**From code only (not tested)**: Second problem is stuck. Other buttons stay disabled and there is no field to change slug. Only way is to rename it on Polygon.
 
 ---
 
-### Q4: Data discarded by "Migrate Test Cases to DB"
+### Q4
 
-**Migration action**: "Migrate Test Description to Database" (the button that migrates test cases to the database).
+> When test cases are saved to the database via "Migrate Test Cases to DB", some data is intentionally discarded. What data is lost? Why might this cause problems?
 
-**What is lost (From code)**:
-In `views.py:533-541`: (1) each test's input and output is cut to the first **260 characters**; (2) trailing
-whitespace is removed from both (`rstrip()`); (3) any test whose input or output is empty is **skipped entirely**
-(`if input_data and output_data`). Descriptions and the sample flag are kept.
+**Migration action**: "Migrate Test Description to Database" on a problem with four tests I made for this: a normal one, one with 801 character input, one with empty output, one with spaces at end of output.
 
-**Why this can cause problems**:
-- A test with large input or output is stored incomplete, so the database copy cannot be used to run or compare
-  that test. Storage keeps the full data, so the two copies of the same test no longer match.
-- Removing trailing whitespace and newlines can change a test that a strict checker compares exactly.
-- Skipped tests (for example an empty expected output) disappear from the database, and `order` only counts
-  kept tests, while storage numbers every test by position, so the numbering of the database and storage can
-  differ after a skip.
-- None of this is shown to the user: the message only says "Test cases description migrated to database
-  Successfully."
+**What is lost (Tested)**: Page only said "migrated to database Successfully", but:
+- Everything after 260 characters. The 801 character input was saved as 260. Storage had full 801.
+- Whitespace at the end. `ok` with three newlines was saved as `ok`.
+- The whole test if input or output is empty. Table had rows 1, 2, 3 but storage had `01`, `02`, `04`.
 
-I did not run a test with input over 260 characters, so these points come from code reading, not from running it.
+**Why (code)**: `views.py:488-489` strips both values, `:493` skips empty tests and `:495-496` cuts to 260 characters.
+
+**Why it could cause problems**: Database copy of a big test is not the real test and nothing marks it as cut. An exact checker can give different result without the trailing whitespace. After a skipped test the numbers don't match anymore, row 3 in database is file `04` in storage.
 
 ---
 
 ## Notes
 
-- **Setup blocker found and fixed:** the `Problem` model defines `notes` and `genie_chat`, but the initial
-  migration did not create them, so the first fetch failed with "column problems_problem.notes does not exist".
-  I added migration `0002_problem_genie_chat_problem_notes.py` (included in the PR).
-- **Environment gotcha:** `load_dotenv` does not override variables already in the process, so after changing
-  `STORAGE_PROVIDER` in `.env` the dev server had to be fully restarted, not just auto-reloaded.
+- For cases I could not make on a real Polygon problem (failed download, removed tests, same titles, long tests) I ran the real view code with a fake Polygon and rolled back the database.
+- I did not put Q2, Q3 and Q4 in product top 3 because each need a special situation. The three I picked comes in a normal migration.
+- Starter code did not run until I added migration `0002` for `notes` and `genie_chat`.
+- Create/Update overwrites a problem without warning and always makes constraints and editorial blank.

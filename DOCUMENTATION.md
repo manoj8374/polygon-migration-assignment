@@ -1,143 +1,173 @@
-# Polygon Migration Tool — Documentation
+# Functionality Documentation
 
-How the tool works, from browser to backend to database / Polygon / cloud storage. It describes the **current implementation**, quirks included. Paths are relative to `PolygonMigration/` (the folder with `manage.py`).
+This tool is for staff users. It copies a problem from Polygon into our PostgreSQL database and uploads its test files to cloud storage (S3 or Azure). I wrote this for the current code in this branch, after my storage fixes.
 
-## 1. Overview
+One thing to know before reading: the whole tool is one page. Every button sends a POST to `/` and all of them are handled by `index()` in `problems/views.py`. The page is `problems/templates/problems/index.html`. Each form has a hidden field, and that is how `index()` knows which button was pressed.
 
-| Piece | Where | Role |
+## 1. User Flows
+
+### Flow 1: User login
+
+**What the user does**: Opens `/`, gets redirected to `/users/login/`, enters email and password and clicks **Login**.
+
+**What the frontend sends**: `POST /users/login/` with `email`, `password` and `csrfmiddlewaretoken`. The form is in `users/templates/users/login.html`.
+
+**What the backend does (in order)**: This is `login_view()` in `users/views.py`.
+1. If somebody is already logged in, it logs them out first.
+2. It calls Django's `authenticate()`. That goes to `EmailBackend` in `users/backends.py`, which finds the user by email and checks the password. It also rejects users who are not active (`is_active` false).
+3. If user is not found or password is wrong, message is "Invalid email or password."
+4. If user is not staff (`is_staff` false), message is "You do not have staff access."
+5. Otherwise it calls `login()` and redirects to `/`. The `?next=` in the URL is ignored.
+
+**External APIs called**: None.
+
+**Database / storage read or written**: Reads the user from `users_user`. On success it writes a session row in `django_session` and updates `last_login`. Session stays for one day (`SESSION_COOKIE_AGE` in `settings.py`).
+
+**What the user sees**: The main page "Hatsu: Problem Migrator" with a box for the Polygon problem ID. If login fails, the same login page with a red message.
+
+Also good to know: `index()` has `user_passes_test` on it, so anyone who is not a logged in staff user is sent to `/users/login/`. The **Logout** button posts to `/users/logout/` (`logout_view()`), which ends the session and goes back to login page.
+
+---
+
+### Flow 2: Fetching a problem from Polygon
+
+**What the user does**: Types a Polygon problem ID and clicks **Fetch Problem**.
+
+**What the frontend sends**: `POST /` from the form `fetchForm` with `problem_id` and the CSRF token. The JavaScript shows a loading overlay before sending.
+
+**What the backend does (in order)**: `index()` does the work, using the `PolygonAPI` class from `problems/polygon_api.py`.
+1. Loads all tags from the database for the tag picker. This happens on every request.
+2. Checks if a `Problem` with this `polygon_id` is already saved. If yes, the page uses its saved difficulty and tags, and the main solution is fetched from Polygon.
+3. Gets time limit and memory limit with `get_problem_info()`.
+4. `download_and_extract_package()` downloads the latest standard package, unzips it in a temp folder and reads `problem.html`.
+5. `parse_problem_html()` picks the title, legend, input format, output format and notes from that HTML.
+6. `get_all_test_cases()` gets the test list and then downloads input and answer of each test, one by one. This is the slow part.
+7. `store_test_cases_in_redis()` keeps these tests in Redis for 30 minutes, so the next buttons don't need to download again.
+8. Gets the checker name. A standard one like `std::ncmp.cpp` becomes `ncmp`. Anything not in the known list becomes `custom`.
+9. Counts the tests with `get_test_cases()` and renders the page.
+
+**External APIs called**: Polygon: `problem.info` (two times), `problem.packages`, `problem.package`, `problem.tests` (two times), `problem.testInput` and `problem.testAnswer` (once for each test), `problem.checker` (two times). If the problem is already in database, also `problem.updateWorkingCopy`, `problem.solutions` and `problem.viewSolution`.
+
+**Database / storage read or written**: Only reads `Problem` and `ProblemTag`. Nothing is written to database or storage here. The fetched tests go to Redis.
+
+**What the user sees**: Title, slug, limits, checker, test count, the statement parts, a table of all tests (first 50 characters, with **View Full** button for long ones) and the migrate buttons. If the problem is not in database yet, page says "Please migrate to database first." and the two test buttons are disabled. If something fails, a red box says "Migration failed and all database changes have been rolled back. Reason: ..." and the saved tests for this ID are removed from Redis.
+
+---
+
+### Flow 3: Migrating a problem to the database
+
+**What the user does**: After fetch, selects a difficulty, picks tags if needed, and clicks **Create/Update problem in Database**.
+
+**What the frontend sends**: `POST /` from the form `migrate-db-form` with `problem_id`, `migrate_to_db=1`, `difficulty` and one `tags` field per selected tag. The JavaScript copies the dropdown value and tags into hidden fields, and it blocks the submit if difficulty is not selected.
+
+**What the backend does (in order)**: Still `index()`, and everything is inside one `transaction.atomic()` block.
+1. Runs the same fetch as Flow 2. Only difference is tests are taken from Redis if they are still there.
+2. If `difficulty` is empty it stops. The error handler wraps the message, so the user sees "Migration failed and all database changes have been rolled back. Reason: Please select a difficulty level before migrating to database."
+3. Looks for a `Problem` with same `polygon_id`. If found it **updates** that row, if not it **creates** a new one. Slug is made from the title with `slugify()`.
+4. Removes all tags of the problem and adds the selected ones again. A tag that doesn't exist is created.
+5. Takes the tests marked as sample on Polygon and saves them as `SampleTestCase` rows. Existing rows are overwritten by position and extra ones are created. Samples with empty input or output are skipped.
+6. Fetches the main solution from Polygon so the page can show it.
+
+**External APIs called**: Polygon, same as Flow 2 but without the per-test calls when tests are in Redis. Plus `problem.solutions` and `problem.viewSolution`.
+
+**Database / storage read or written**: Writes `problems_problem` (title, slug, difficulty, statement, input and output format, limits, checker type, test count, notes). Constraints and editorial are always saved as empty. Also writes `problems_problemtag`, the problem-tag link table and `problems_sampletestcase`. Nothing in storage.
+
+**What the user sees**: A blue box: "Problem '<title>' created in database successfully." or "... updated in database successfully.", with one more line if a custom checker was found. Page now shows the database problem ID and the two test buttons get enabled. Migrating the same Polygon ID again is okay, it just updates the row. It fails only when a **different** problem already has the same slug (same title). Then a red box shows the database error and nothing is saved.
+
+---
+
+### Flow 4: Migrating test cases to the database
+
+**What the user does**: Clicks **Migrate Test Description to Database**. It is below the test table, and disabled until Flow 3 is done.
+
+**What the frontend sends**: `POST /` from the form `migrate-test-cases-form` with `problem_id` and `migrate_test_cases_to_db=1`.
+
+**What the backend does (in order)**: `index()` again, in the same transaction block.
+1. Runs the same fetch as Flow 2 (tests from Redis if present).
+2. Finds the `Problem` by `polygon_id`. If missing, it stops and the user sees "Migration failed and all database changes have been rolled back. Reason: Please migrate the problem to the database first."
+3. Takes tests from Redis, or from Polygon if Redis has none.
+4. For each test: removes whitespace at end of input and output, skips the test if any of them is empty, and cuts both to first 260 characters.
+5. Saves each test as a `ProblemTestCase` row with input, output, sample flag, description and order. Existing rows are overwritten by position and new ones are added. Old rows are never deleted.
+
+**External APIs called**: Polygon, same as Flow 2 (no per-test calls when tests are in Redis).
+
+**Database / storage read or written**: Reads `problems_problem`, writes `problems_problemtestcase`. Nothing in storage.
+
+**What the user sees**: A green box: "Test cases description migrated to database Successfully." The rows can be seen in admin at `/admin/`.
+
+---
+
+### Flow 5: Uploading test cases to cloud storage
+
+**What the user does**: Clicks **Migrate Test Cases to Storage**. Also disabled until Flow 3 is done.
+
+**What the frontend sends**: `POST /` from the form `migrate-storage-form` with `problem_id` and `migrate_to_storage=1`.
+
+**What the backend does (in order)**: `index()` first, and then `PolygonAPI.migrate_to_storage()` does the upload.
+1. Before any slow call it checks the problem is in database. If not, it returns an error immediately. We need the database ID because the storage folder is named with it.
+2. Runs the same fetch as Flow 2 (tests from Redis if present). The upload is kept for the end, so nothing on Polygon side can fail after files are already uploaded.
+3. `get_storage()` creates the storage object for the provider we configured.
+4. `delete_problem_test_case_cache()` removes Redis keys starting with `oj_dev_with_redis_storage_test_cases_{database id}`.
+5. Uploads every test that has both input and output, as two files. Tests with empty input or output are skipped and noted. If not even one test was uploaded, it stops with error.
+6. `upload_custom_checker()`: if problem has a custom checker, it downloads the source, compiles with `g++` and uploads the binary. If compile fails, it uploads the source as `custom_checker.cpp`.
+7. Only at this point it deletes old files in the folder which were not part of this upload (`delete_problem_files()` gets the list of new files to keep).
+
+**External APIs called**: Polygon, same as Flow 2, plus one more `problem.checker` call for every problem (to know if the checker is custom). `problem.viewFile` is called only when it is custom. And the storage provider: S3 (`put_object`, `list_objects_v2`, `delete_objects`) or Azure Blob (`upload_blob`, `list_blobs`, `delete_blob`).
+
+**Database / storage read or written**: Reads `problems_problem` to get the ID. Writes nothing in database. Writes and deletes files under `test_cases/{database id}/` in storage.
+
+**What the user sees**: A green box with counts, like "Uploaded 13 of 13 test cases to storage (s3) under test_cases/5/." It also tells which tests were skipped and what happened with the custom checker. On failure there is only one red box and no success message. If upload had started: "Storage migration failed: ... Files already in storage were not deleted, but files with the same name may have been replaced." If it had not started: "Storage migration did not start, so storage was not changed. Reason: ..."
+
+---
+
+## 2. External Integrations
+
+### 2.1 Polygon API
+
+Almost every call goes through `PolygonAPI._make_request()` in `problems/polygon_api.py`. The one exception is the package download (`problem.package`), which calls `requests.post` directly inside `download_and_extract_package()` with its own signature. Each call is a `POST` to `https://polygon.codeforces.com/api/{method}`.
+
+**Endpoints used** (and which flow uses each):
+
+| Endpoint | What we get | Used in |
 |---|---|---|
-| Settings / URLs | `PolygonMigration/settings.py`, `urls.py` | Loads `.env`; configures Postgres, Redis, Polygon, storage |
-| `users` app | `users/` | Custom email-login `User`, `EmailBackend`, login/logout views |
-| `problems` app | `problems/` | The tool itself: `views.index`, `polygon_api.py`, models, `storage/`, one template |
-| `contents` app | `contents/` | Only a `Topic` model; unrelated to migration |
-| PostgreSQL | `settings.DATABASES` | Users, sessions, problems, tags, test cases |
-| Redis | `settings.REDIS_*` | 30-minute cache of test cases fetched from Polygon |
-| Cloud storage | `STORAGE_PROVIDER` (`s3` / `azure`) | Test-case files |
+| `problem.info` | Time and memory limit | Flows 2 to 5 |
+| `problem.packages` | List of built packages | Flows 2 to 5 |
+| `problem.package` | The package zip, `problem.html` is inside it | Flows 2 to 5 |
+| `problem.tests` | Test list with index, sample flag and description | Flows 2 to 5 |
+| `problem.testInput`, `problem.testAnswer` | Input and answer of one test | Flow 2, and Flows 3 to 5 if Redis is empty |
+| `problem.checker` | Checker name | Flows 2 to 5 |
+| `problem.updateWorkingCopy` | Nothing, it updates the working copy on Polygon | Flows 2 to 5, only if problem is in database |
+| `problem.solutions`, `problem.viewSolution` | Solution list and code of the main solution | Same as above, and Flow 3 |
+| `problem.viewFile` | Source of the custom checker | Flow 5 |
 
-**URLs:** `/` → `problems.views.index` · `/users/login/` → `login_view` · `/users/logout/` → `logout_view` · `/admin/`.
+**How requests are authenticated**: `_generate_api_sig()` signs every request using the key and secret from `.env` (`POLYGON_API_KEY`, `POLYGON_API_SECRET`, loaded in `settings.py`).
+1. Add `apiKey` and `time` (current Unix time in seconds) to the request parameters.
+2. Sort all parameters by name and join them like `name=value&name=value`.
+3. Make 6 random characters, call it `rand`.
+4. Build the text `rand/method?parameters#secret` and hash it with SHA-512.
+5. Send `apiSig = rand + hash` along with `apiKey`, `time` and the other parameters.
 
-**One view does everything.** Every button on `/` POSTs to `index()` (`problems/views.py`); the hidden field decides the action:
+Polygon makes the same hash on its side and compares, so the secret itself is never sent. For JSON calls, if Polygon replies with `status: FAILED`, the code raises an error with Polygon's comment. The plain-text calls (`problem.testInput`, `problem.testAnswer`, `problem.viewSolution`, `problem.viewFile`) don't have this check, they just return the response text.
 
-| Form | UI button | Field | Action |
-|---|---|---|---|
-| `fetchForm` | Fetch Problem | `problem_id` only | Fetch and display |
-| `migrate-db-form` | Create/Update problem in Database | `migrate_to_db` | Save problem, tags, sample tests |
-| `migrate-test-cases-form` | Migrate Test Description to Database | `migrate_test_cases_to_db` | Save all tests to `ProblemTestCase` |
-| `migrate-azure-form` | Migrate Test Cases to Storage | `migrate_to_azure` | Upload files to storage |
+### 2.2 Cloud storage
 
-(The assignment calls these “Migrate to Database / Migrate Test Cases to DB / upload to storage”; the table shows the real labels. `migrate_to_azure` is a legacy name meaning “the configured provider”.)
+The code is in `problems/storage/`. `base.py` has the common interface `TestCaseStorage`, and `s3.py` and `azure.py` are the two providers.
 
-Every click first re-runs the same **fetch-for-display block** (Polygon info, package, checker, tests), then the action-specific work. That is why every flow shares the same Polygon calls and is slow.
+**How the provider is chosen**: `settings.py` reads `STORAGE_PROVIDER` from `.env` (default is `azure`). Then `get_storage()` in `problems/storage/__init__.py` returns `S3Storage` for `s3` and `AzureStorage` for `azure`. Any other value raises `ImproperlyConfigured`. S3 uses the `AWS_*` settings and Azure uses the `AZURE_*` ones. After changing `.env` the server has to be restarted.
 
-**Models** (`problems/models.py`): `Problem` (unique `polygon_id` and `slug`, difficulty, statement fields, limits, `checker_type`, `test_case_count`, `notes`, tags M2M), `ProblemTag`, `SampleTestCase`, `ProblemTestCase` (`is_sample`, `input`, `output`, `description`, `order`).
+**How files are named and organized**: The folder is the **database** problem ID, not the Polygon ID. `NN` is the position of the test in Polygon's list, in two digits.
 
-**Setup gotchas:** `settings.py` raises if `POLYGON_API_KEY/SECRET` are missing (even for `migrate`); `createsuperuser` sets `is_staff`, which login requires; the problem needs a **built package** on Polygon or fetch fails; custom checkers need `g++` (else the `.cpp` source is uploaded); without Redis everything still works but re-downloads all tests each click.
-
-## 2. User flows
-
-### Flow 1 — Login
-- **User does:** enters email and password at `/users/login/`, clicks Login.
-- **Sent:** plain form POST: `email`, `password`, CSRF token (`login.html`, no JS).
-- **Backend (`users.views.login_view`):**
-  1. Logs out any already-authenticated user.
-  2. Calls `authenticate(request, username=email, email=email, password=...)`.
-  3. `users.backends.EmailBackend` gets the user by email, checks the password and `is_active`.
-  4. If the user is `is_staff`: `login()` and redirect to `problems:index`. Otherwise an error message (“You do not have staff access.” / “Invalid email or password.”).
-- **External APIs:** none.
-- **DB:** reads `users_user`; writes a `django_session` row (1-day lifetime).
-- **User sees:** the “Hatsu: Problem Migrator” page with a welcome line and Logout, or a red alert.
-- **Access control:** `index` uses `@user_passes_test(is_authenticated and is_staff, login_url='/users/login/')`. `next` is ignored. Logout (POST `/users/logout/`) calls `logout()` and redirects to login.
-
-### Flow 2 — Fetch a problem from Polygon
-- **User does:** enters a Polygon problem ID, clicks Fetch Problem.
-- **Sent:** JS shows a spinner, then POSTs `problem_id` + CSRF to `/`.
-- **Backend (`index`):**
-  1. Loads existing tags for the picker; creates `PolygonAPI()`.
-  2. If the problem is **already in the DB**: calls `problem.updateWorkingCopy`, then `problem.solutions` and `problem.viewSolution` for the main solution (tag `MA`, else first), and restores its stored difficulty and tags.
-  3. Inside `transaction.atomic()`: `get_problem_info()`, then `download_and_extract_package()` (newest `standard` package → ZIP → `problem.html`), then `parse_problem_html()` (title, legend, input/output spec, notes).
-  4. `get_all_test_cases()`: list tests, then input and answer for each test. A failed test becomes empty input/output instead of aborting. Result cached in Redis for 30 min.
-  5. Resolves the checker (`std::` and `.cpp` stripped; non-standard → `custom`), counts tests, builds `fetched_problem`. `constraints` and `editorial` are always empty.
-- **External APIs:** `problem.info`, `problem.packages`, `problem.package`, `problem.tests`, `problem.testInput`, `problem.testAnswer`, `problem.checker` (some called twice); plus `updateWorkingCopy`, `solutions`, `viewSolution` for existing problems.
-- **DB/storage:** read-only on `Problem`; **nothing written** except Redis keys.
-- **User sees:** title, DB id and Algopath link (or “migrate first”), slug, difficulty and tag pickers, limits, checker, test count, statement/formats/notes, a test-case table with previews, the main solution, and the action buttons. Statement HTML is auto-escaped, so tags show as literal text.
-
-### Flow 3 — Migrate the problem to the database
-- **User does:** picks a difficulty (required) and tags, clicks Create/Update problem in Database.
-- **Sent:** `problem_id`, `migrate_to_db=1`, `difficulty`, one hidden `tags` input per tag (new tags go in `tags` too; `new_tag` is never sent by this template).
-- **Backend (`index`):**
-  1. Runs the fetch block (test cases read from Redis if cached).
-  2. Rejects empty difficulty (transaction rolls back).
-  3. Updates the `Problem` with that `polygon_id`, or creates it, from the fetched fields.
-  4. Tags: `extra_tags.clear()`, then `get_or_create` + `add` for each submitted tag (replaces old tags).
-  5. Sample tests (`useInStatements`): rstrip, skip empties, update `SampleTestCase` by position or create (order 1, 2, …). Extra old rows are not deleted.
-  6. Fetches the main solution for display.
-- **External APIs:** as Flow 2, plus `solutions` and `viewSolution`.
-- **DB:** writes `Problem`, `ProblemTag`, the tags join table, `SampleTestCase`, all atomically. A duplicate `slug` (same title) or `polygon_id` makes it fail and roll back.
-- **User sees:** blue “Problem '…' created/updated” alert, DB id and link filled in, tag chips, solution shown, other buttons enabled.
-
-### Flow 4 — Migrate test cases to the database
-- **User does:** clicks Migrate Test Description to Database (enabled only once the problem is in the DB).
-- **Sent:** `problem_id`, `migrate_test_cases_to_db=1`.
-- **Backend (`index`):**
-  1. Runs the fetch block; errors if the `Problem` does not exist.
-  2. Gets tests from Redis or Polygon.
-  3. For each test: rstrip input/output, **skip if either is empty**, **truncate each to 260 characters**, then overwrite the existing `ProblemTestCase` at that position or create one (`order` 1, 2, …). Leftover old rows stay.
-- **External APIs:** same fetch calls as Flow 2.
-- **DB:** writes `ProblemTestCase` only (not `SampleTestCase`, not `test_case_count`).
-- **User sees:** green “Test cases description migrated…” alert. The table still shows full Polygon data, not what was stored (check `/admin/`). The truncation is silent.
-
-### Flow 5 — Upload test cases to cloud storage
-- **User does:** clicks Migrate Test Cases to Storage (enabled only once the problem is in the DB).
-- **Sent:** `problem_id`, `migrate_to_azure=1`.
-- **Backend (`index` → `PolygonAPI.migrate_to_storage`):**
-  1. Requires the `Problem`; its **DB id** names the files.
-  2. `get_storage()` builds `S3Storage` or `AzureStorage` from `STORAGE_PROVIDER`.
-  3. Gets tests from Redis or Polygon.
-  4. `storage.delete_problem_files(id)` wipes `test_cases/{id}/`, then each test with both input and output is uploaded via `upload_test_case(id, idx, in, out)`. `idx` is the 1-based position in Polygon's list, so skipped tests leave gaps.
-  5. For a custom checker: fetch its source (`problem.viewFile`), compile with `g++`, upload the binary (or the `.cpp` if compiling fails).
-  6. The fetch block then runs to redisplay the page.
-- **External APIs:** Polygon as above, plus `problem.viewFile`; S3 (`PutObject`, `ListObjectsV2`, `DeleteObjects`) or Azure Blob.
-- **DB/storage:** DB read-only; storage is delete-then-write.
-- **User sees:** green “Test cases migrated to storage (provider) successfully.” Verify by listing `test_cases/<Problem.id>/` in the bucket and opening `01` and `01.a`.
-- **Failure:** on any exception the DB rolls back, Redis keys are cleared, and files are deleted if the upload had completed. Storage is not transactional, so a mid-upload failure leaves partial files.
-- **Quirk:** `delete_problem_test_case_cache` uses the key prefix `oj_dev_with_redis_storage_test_cases_…`, not the one this app writes, so it clears nothing and the 30-minute cache stays in use.
-
-**Database vs storage:** the DB holds searchable metadata plus 260-character previews of tests, updated in place. Storage holds the **full** input/output files (and the checker), wiped and rewritten each time.
-
-## 3. External integrations
-
-### 3.1 Polygon API (`problems/polygon_api.py`)
-Every call is a POST to `https://polygon.codeforces.com/api/<method>`. **Auth** (`_generate_api_sig`): add `apiKey` and `time` to the params, sort and URL-encode them, pick a random 6-char `rand`, compute `SHA-512(rand/<method>?<params>#<secret>)`, and send `apiSig = rand + hex`. The secret is never sent. JSON replies are `{status, result, comment}`; `FAILED` raises. `testInput`, `testAnswer`, `viewSolution` and `viewFile` return plain text; `problem.package` returns a ZIP.
-
-Endpoints used: `problem.info`, `problem.packages`, `problem.package`, `problem.tests`, `problem.testInput`, `problem.testAnswer`, `problem.checker`, `problem.solutions`, `problem.viewSolution`, `problem.updateWorkingCopy`, `problem.viewFile`.
-
-### 3.2 Cloud storage (`problems/storage/`)
-`TestCaseStorage` (`base.py`) defines `upload_test_case`, `upload_file`, `delete_problem_files` and the naming helpers. The migration code only uses this interface; `get_storage()` picks the provider. To add one, subclass it and add a branch there.
-
-| Provider | Class | Env vars |
-|---|---|---|
-| S3 / S3-compatible | `S3Storage` | `AWS_S3_BUCKET_NAME`, `AWS_REGION`, `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, optional `AWS_S3_ENDPOINT_URL` |
-| Azure Blob | `AzureStorage` | `AZURE_STORAGE_ACCOUNT_URL`, `AZURE_TENANT_ID`, `AZURE_CLIENT_ID`, `AZURE_USERNAME`, `AZURE_PASSWORD`, `AZURE_CONTAINER_NAME` |
-
-Set `STORAGE_PROVIDER=s3|azure` (default `azure`).
-
-**Layout** (same for all providers):
 ```
-test_cases/{Problem.id}/{NN}      input of test NN (1-based, zero-padded to 2 digits)
-test_cases/{Problem.id}/{NN}.a    expected output
-test_cases/{Problem.id}/custom_checker[.exe|.cpp]   only for custom checkers
+test_cases/5/01                 input of test 1
+test_cases/5/01.a               expected output of test 1
+test_cases/5/02, 02.a, ...
+test_cases/5/custom_checker     only for a custom checker (.exe on Windows, .cpp if it did not compile)
 ```
-Files are UTF-8; samples are included in Polygon order. S3 errors propagate; the Azure wrapper logs and swallows upload errors.
 
-### 3.3 Redis
-Keys `polygon_migration_test_cases_{polygon_id}_count` and `…_test_{n}`, 30-minute TTL. **Fetch** always refreshes the cache; the migrate actions reuse it, so Polygon edits made in the last 30 minutes can be migrated stale. All Redis errors are logged and ignored.
+The names are built in one place only, the helper methods in `base.py`, so both providers have same layout.
 
-## 4. Other env vars
-`SECRET_KEY`, `DEBUG`, `ALLOWED_HOSTS`, `DB_NAME/USER/PASSWORD/HOST/PORT`, `REDIS_HOST/PORT/PASSWORD/SSL`, `POLYGON_API_KEY/SECRET`, optional `CUSTOM_CHECKER_DIR`. `.env` is git-ignored; `.env.example` lists everything.
+**What happens on errors**: Both providers raise an error when upload, list or delete fails. S3 also checks the reply of `delete_objects`, because S3 can report failed deletes inside a normal response. If a custom checker can't be fetched or uploaded, the whole migration fails. And because old files are deleted only at the very end, a failed migration never leaves the folder empty.
 
-## 5. Code map
-- Button behaviour: `problems/views.py` → `index()`; statement parsing: `parse_problem_html()`
-- Polygon calls and signing: `problems/polygon_api.py`
-- Storage layout / providers: `problems/storage/base.py`, `__init__.py`
-- Login rules: `users/views.py`, `users/backends.py`
-- UI and JS: `problems/templates/problems/index.html`
+### 2.3 Redis (used by Flows 2 to 5)
+
+I added this part because Flows 2 to 5 don't make sense without it. Fetched tests are kept in Redis for 30 minutes under `polygon_migration_test_cases_{polygon id}_count` and `..._test_{n}`. Fetch always writes them. The three migrate buttons read them first and go back to Polygon only if they are missing. Any error in `index()` removes them for that problem. If Redis is down, the code just logs it and fetches from Polygon every time.

@@ -38,14 +38,21 @@ class TestCaseStorage(ABC):
         return f"{cls.ROOT}/{problem_id}/{filename}"
 
     # ---- operations every provider must implement ----
+    # Error contract: every method raises an exception when the provider reports
+    # a failure. Providers must not log an error and carry on, because the caller
+    # reports success to the user when no exception is raised.
     @abstractmethod
     def upload_test_case(self, problem_id, test_number, input_data, output_data):
-        """Upload one test case (input + output) as two objects."""
+        """Upload one test case (input + output) as two objects. Returns the two keys."""
 
     @abstractmethod
-    def delete_problem_files(self, problem_id):
-        """Delete every object under ``test_cases/{problem_id}/``."""
+    def delete_problem_files(self, problem_id, keep=()):
+        """
+        Delete the objects under ``test_cases/{problem_id}/`` whose key is not in
+        ``keep``. With the default empty ``keep`` everything is deleted.
+        Returns the number of deleted objects.
+        """
 
     @abstractmethod
     def upload_file(self, problem_id, filename, data):
-        """Upload an arbitrary file (bytes) under ``test_cases/{problem_id}/``."""
+        """Upload an arbitrary file under ``test_cases/{problem_id}/``. Returns its key."""
