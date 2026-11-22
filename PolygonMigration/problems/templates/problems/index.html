@@ -247,10 +247,10 @@
                         <button class="btn btn-warning" type="submit">Create/Update problem in Database</button>
                     </form>
 
-                    <form method="post" style="display: inline;" id="migrate-azure-form">
+                    <form method="post" style="display: inline;" id="migrate-storage-form">
                         {% csrf_token %}
                         <input type="hidden" name="problem_id" value="{{ problem_id }}">
-                        <input type="hidden" name="migrate_to_azure" value="1">
+                        <input type="hidden" name="migrate_to_storage" value="1">
                         <button class="btn btn-success {% if not db_problem %}disabled{% endif %}" type="submit" {% if not db_problem %}disabled data-bs-toggle="tooltip" data-bs-placement="top" title="Please migrate the problem to the database first."{% endif %}>Migrate Test Cases to Storage</button>
                     </form>
                 </div>
@@ -425,10 +425,10 @@
             });
         }
         
-        // Handle migrate to Azure form
-        var azureForm = document.getElementById('migrate-azure-form');
-        if (azureForm) {
-            azureForm.addEventListener('submit', function() {
+        // Handle migrate to storage form
+        var storageForm = document.getElementById('migrate-storage-form');
+        if (storageForm) {
+            storageForm.addEventListener('submit', function() {
                 showLoading('Migrating to storage...');
             });
         }

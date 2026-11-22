@@ -572,22 +572,30 @@ class PolygonAPI:
         Fetches, compiles and uploads a custom checker through the storage backend.
         If compilation fails, the checker source (custom_checker.cpp) is uploaded instead.
 
+        Errors are not swallowed: if the checker source cannot be fetched or the
+        upload fails, an exception is raised so the caller can fail the migration.
+
         Args:
             problem_id (str): The Polygon problem ID.
             storage (TestCaseStorage): The storage backend to upload to.
             db_problem_id (str|int, optional): The database problem ID used for naming.
+
+        Returns:
+            dict or None: None when the problem uses a standard checker. Otherwise
+            {'name': checker name on Polygon, 'key': storage key that was uploaded,
+            'compiled': True if the binary was uploaded, False if only the source was}.
         """
         logger.info("Processing custom checker for problem %s", problem_id)
 
         checker_info = self.get_custom_checker_info(problem_id)
         if not checker_info:
             logger.info("No custom checker found for problem %s", problem_id)
-            return
+            return None
 
-        source_code = self.fetch_custom_checker_file(problem_id, checker_info['name'])
+        checker_name = checker_info['name']
+        source_code = self.fetch_custom_checker_file(problem_id, checker_name)
         if not source_code:
-            logger.error("Failed to fetch custom checker source code")
-            return
+            raise RuntimeError(f"Could not fetch the source of custom checker '{checker_name}' from Polygon")
         logger.info("Custom checker source code fetched, length: %d", len(source_code))
 
         naming_id = db_problem_id if db_problem_id is not None else problem_id
@@ -597,23 +605,24 @@ class PolygonAPI:
             binary_path = self.compile_custom_checker(source_code, work_dir)
             if not binary_path:
                 logger.warning("Failed to compile custom checker, uploading source code instead")
-                storage.upload_file(naming_id, 'custom_checker.cpp', source_code)
-                return
+                key = storage.upload_file(naming_id, 'custom_checker.cpp', source_code)
+                return {'name': checker_name, 'key': key, 'compiled': False}
             with open(binary_path, 'rb') as f:
                 binary_data = f.read()
             logger.info("Uploading compiled custom checker (%d bytes)", len(binary_data))
-            storage.upload_file(naming_id, binary_filename, binary_data)
+            key = storage.upload_file(naming_id, binary_filename, binary_data)
+            return {'name': checker_name, 'key': key, 'compiled': True}
 
         try:
             checker_dir = settings.CUSTOM_CHECKER_DIR
             if checker_dir:
                 os.makedirs(checker_dir, exist_ok=True)
-                compile_and_upload(checker_dir)
-            else:
-                with tempfile.TemporaryDirectory() as temp_dir:
-                    compile_and_upload(temp_dir)
+                return compile_and_upload(checker_dir)
+            with tempfile.TemporaryDirectory() as temp_dir:
+                return compile_and_upload(temp_dir)
         except Exception as e:
-            logger.error(f"Error uploading custom checker: {e}")
+            logger.error("Error uploading custom checker: %s", e, exc_info=True)
+            raise RuntimeError(f"Custom checker '{checker_name}' could not be uploaded: {e}") from e
 
     def migrate_to_storage(self, problem_id, storage, db_problem_id=None, testset='tests'):
         """
@@ -622,11 +631,22 @@ class PolygonAPI:
         Only test cases with both input and output are uploaded. Also handles the custom
         checker if present.
 
+        Order matters: the new files are uploaded first, and files left over from an
+        earlier migration are deleted only after every upload succeeded. If anything
+        fails on the way, an exception is raised and nothing has been deleted, so the
+        problem is never left with an empty folder.
+
         Args:
             problem_id (str): The Polygon problem ID.
             storage (TestCaseStorage): The storage backend to upload to.
             db_problem_id (str|int, optional): The database problem ID used for naming.
             testset (str, optional): The testset name. Defaults to 'tests'.
+
+        Returns:
+            dict: {'total': tests received, 'uploaded': tests uploaded,
+            'skipped': numbers of tests skipped for missing input/output,
+            'checker': result of upload_custom_checker (or None),
+            'stale_deleted': number of old files removed}.
         """
         logger.info("Starting migrate_to_storage for problem %s", problem_id)
 
@@ -644,24 +664,45 @@ class PolygonAPI:
         naming_id = db_problem_id if db_problem_id is not None else problem_id
         logger.info("Using naming id: %s", naming_id)
 
-        # Delete all existing test case files before uploading the new ones
-        logger.info("Deleting existing test case files from storage")
-        storage.delete_problem_files(naming_id)
-
+        # Step 1: upload the new files (same names are overwritten).
+        uploaded_keys = []
         uploaded_count = 0
+        skipped = []
         for idx, test in enumerate(test_cases, start=1):
             input_data = test.get('input', '')
             output_data = test.get('output', '')
             if input_data and output_data:
-                storage.upload_test_case(naming_id, idx, input_data, output_data)
+                uploaded_keys.extend(storage.upload_test_case(naming_id, idx, input_data, output_data))
                 uploaded_count += 1
             else:
+                skipped.append(idx)
                 logger.warning(f"Skipping test case #{idx}: missing input or output. input: {repr(input_data[:50] + ('...' if len(input_data) > 50 else ''))}, output: {repr(output_data[:50] + ('...' if len(output_data) > 50 else ''))}")
 
         logger.info("Uploaded %d test cases to storage", uploaded_count)
 
-        self.upload_custom_checker(problem_id, storage, db_problem_id)
+        # Nothing usable came from Polygon: stop here so step 3 cannot wipe the old files.
+        if uploaded_count == 0:
+            raise RuntimeError(
+                f"None of the {len(test_cases)} test cases had both input and output, so nothing was uploaded"
+            )
+
+        # Step 2: custom checker (raises if it cannot be fetched or uploaded).
+        checker = self.upload_custom_checker(problem_id, storage, db_problem_id)
+        if checker:
+            uploaded_keys.append(checker['key'])
+
+        # Step 3: only now remove files from an earlier migration that are no longer needed.
+        logger.info("Deleting stale files from storage")
+        stale_deleted = storage.delete_problem_files(naming_id, keep=uploaded_keys)
+
         logger.info("Completed migrate_to_storage for problem %s", problem_id)
+        return {
+            'total': len(test_cases),
+            'uploaded': uploaded_count,
+            'skipped': skipped,
+            'checker': checker,
+            'stale_deleted': stale_deleted,
+        }
 
     def delete_problem_test_case_cache(self, db_problem_id):
         """

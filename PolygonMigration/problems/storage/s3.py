@@ -1,4 +1,4 @@
-"""AWS S3 implementation (also works with S3-compatible services via endpoint_url)."""
+"""AWS S3 implementation of TestCaseStorage."""
 import logging
 
 import boto3
@@ -24,26 +24,42 @@ class S3Storage(TestCaseStorage):
         )
 
     def _put(self, key, body):
+        # put_object raises botocore ClientError on failure; we let it propagate.
         self.client.put_object(Bucket=self.bucket, Key=key, Body=body)
         logger.info("Uploaded s3://%s/%s", self.bucket, key)
+        return key
 
     def upload_test_case(self, problem_id, test_number, input_data, output_data):
-        self._put(self.input_key(problem_id, test_number), input_data.encode("utf-8"))
-        self._put(self.output_key(problem_id, test_number), output_data.encode("utf-8"))
+        return [
+            self._put(self.input_key(problem_id, test_number), input_data.encode("utf-8")),
+            self._put(self.output_key(problem_id, test_number), output_data.encode("utf-8")),
+        ]
 
     def upload_file(self, problem_id, filename, data):
         if isinstance(data, str):
             data = data.encode("utf-8")
-        self._put(self.file_key(problem_id, filename), data)
+        return self._put(self.file_key(problem_id, filename), data)
 
-    def delete_problem_files(self, problem_id):
+    def delete_problem_files(self, problem_id, keep=()):
         prefix = self.problem_prefix(problem_id)
+        keep = set(keep)
         paginator = self.client.get_paginator("list_objects_v2")
         deleted = 0
         for page in paginator.paginate(Bucket=self.bucket, Prefix=prefix):
-            objects = [{"Key": o["Key"]} for o in page.get("Contents", [])]
+            objects = [{"Key": o["Key"]} for o in page.get("Contents", []) if o["Key"] not in keep]
             if not objects:
                 continue
-            self.client.delete_objects(Bucket=self.bucket, Delete={"Objects": objects})
+            response = self.client.delete_objects(Bucket=self.bucket, Delete={"Objects": objects})
+            # delete_objects returns HTTP 200 even when some keys could not be
+            # deleted; those are listed under "Errors" and must be checked.
+            errors = response.get("Errors") or []
+            if errors:
+                details = ", ".join(
+                    f"{e.get('Key')} ({e.get('Code')}: {e.get('Message')})" for e in errors
+                )
+                raise RuntimeError(
+                    f"S3 could not delete {len(errors)} object(s) under {prefix}: {details}"
+                )
             deleted += len(objects)
         logger.info("Deleted %d objects under s3://%s/%s", deleted, self.bucket, prefix)
+        return deleted
