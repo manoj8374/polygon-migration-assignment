@@ -141,11 +141,13 @@ Line numbers refer to the current code in this branch, after my fixes, not the o
 
 > A problem is migrated with 20 test cases. Later, the problem setter removes 8 test cases on Polygon (now 12 remain). The problem is re-migrated. What happens?
 
-**Migration action**: All three buttons with 20 tests, then again after tests were reduced to 12.
+**Migration action**: All three buttons with 20 tests, then again after tests were reduced to 12. I did the second round two times, once after pressing Fetch again and once without it.
 
-**What happened (Tested)**: All steps said success but database was wrong. `test_case_count` became 12, but test case table still had 20 rows. Rows 1 to 12 had new content and rows 13 to 20 was the old tests. Sample table kept 3 rows though only 2 samples were left. Storage was correct with 24 files. Also if I did not press Fetch again, it used the old 20 tests, because fetched tests are reused for 30 minutes.
+**What happened (Tested)**: All steps said success in both rounds, but the result depends on the Redis cache.
+- With Fetch pressed first: `test_case_count` became 12, but test case table still had 20 rows. Rows 1 to 12 had new content and rows 13 to 20 was the old tests. Sample table kept 3 rows though only 2 samples were left. Storage was correct with 24 files.
+- Without Fetch (cache less than 30 minutes old): the cache served the old 20 tests. `test_case_count` became 12, but the table kept the 20 old rows, storage said "Uploaded 20 of 20" and still had the old 40 files. So the 8 deleted tests were migrated again and nothing warned about it.
 
-**Why (code)**: Rows are matched by position. If a row exist it is updated, else created (`views.py:499-518`). Nothing is ever deleted. The count comes from a separate Polygon call (`:277`). Storage deletes files that was not in the new upload (`polygon_api.py:696`), so it is correct.
+**Why (code)**: Rows are matched by position. If a row exist it is updated, else created (`views.py:499-518`). Nothing is ever deleted. The count comes from a separate Polygon call (`:277`). Storage deletes files that was not in the new upload (`polygon_api.py:696`), so it is correct. For the cache: Fetch saves all tests in Redis for 30 minutes (`views.py:228`), and the three migrate buttons read that copy first and go to Polygon only if it is missing (`views.py:217-221`, `polygon_api.py:654-658`). Only Fetch, an error, or the 30 minutes ending replaces it. The page does not tell the user to press Fetch again.
 
 **From code only (not tested)**: Anything reading the table will see 20 tests, and rows 13 to 20 have no file in storage.
 
